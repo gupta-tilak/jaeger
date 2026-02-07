@@ -6,6 +6,7 @@ package nlquery
 import (
 	"bytes"
 	"encoding/json"
+	"errors"
 	"iter"
 	"net/http"
 	"net/http/httptest"
@@ -307,6 +308,169 @@ func TestFollowUp_SessionNotFound(t *testing.T) {
 	router.ServeHTTP(rec, req)
 
 	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+// ---- search+analyze endpoint tests ----
+
+func newTestAnalysisHandlerWithToolCaller(
+	t *testing.T,
+	modelResp string,
+	tc ToolCaller,
+) *AnalysisHandler {
+	t.Helper()
+	traceReader := &tracestoremocks.Reader{}
+	traceReader.On("GetTraces", mock.Anything, mock.Anything).
+		Return(emptyTracesIter()).Maybe()
+	qs := querysvc.NewQueryService(traceReader, &depsmocks.Reader{}, querysvc.QueryServiceOptions{})
+	model := &mockModel{response: modelResp}
+	sm := NewSessionManager(time.Minute)
+	t.Cleanup(sm.Close)
+	cfg := Config{Enabled: true, Temperature: 0.1, MaxTokens: 256}
+	analyzer := NewAnalyzer(model, cfg, sm, zap.NewNop())
+	return NewAnalysisHandler(qs, analyzer, zap.NewNop(), WithToolCaller(tc))
+}
+
+func TestSearchAnalyze_Success(t *testing.T) {
+	tc := &mockToolCaller{
+		searchResult: []TraceSearchResult{
+			{
+				TraceID:      "abc123",
+				RootService:  "frontend",
+				RootSpanName: "GET /home",
+				SpanCount:    3,
+				ServiceCount: 2,
+				DurationUs:   50000,
+				HasErrors:    false,
+			},
+		},
+	}
+	h := newTestAnalysisHandlerWithToolCaller(t, "The traces look healthy.", tc)
+
+	body, _ := json.Marshal(searchAnalyzeRequest{
+		Params: SearchParams{Service: "frontend"},
+	})
+	req := httptest.NewRequest(http.MethodPost, searchAnalyzePath, bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	h.RegisterRoutes(router)
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp searchAnalyzeResponse
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, "The traces look healthy.", resp.Analysis)
+	assert.NotEmpty(t, resp.SessionID)
+	require.Len(t, resp.Traces, 1)
+	assert.Equal(t, "abc123", resp.Traces[0].TraceID)
+}
+
+func TestSearchAnalyze_CustomQuestion(t *testing.T) {
+	tc := &mockToolCaller{
+		searchResult: []TraceSearchResult{
+			{
+				TraceID:     "def456",
+				RootService: "payment",
+				HasErrors:   true,
+			},
+		},
+	}
+	h := newTestAnalysisHandlerWithToolCaller(t, "Payment errors found.", tc)
+
+	body, _ := json.Marshal(searchAnalyzeRequest{
+		Params:   SearchParams{Service: "payment"},
+		Question: "Why are payments failing?",
+	})
+	req := httptest.NewRequest(http.MethodPost, searchAnalyzePath, bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	h.RegisterRoutes(router)
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusOK, rec.Code)
+
+	var resp searchAnalyzeResponse
+	err := json.NewDecoder(rec.Body).Decode(&resp)
+	require.NoError(t, err)
+	assert.Equal(t, "Payment errors found.", resp.Analysis)
+}
+
+func TestSearchAnalyze_MissingService(t *testing.T) {
+	tc := &mockToolCaller{}
+	h := newTestAnalysisHandlerWithToolCaller(t, "", tc)
+
+	body := `{"params":{}}`
+	req := httptest.NewRequest(http.MethodPost, searchAnalyzePath, bytes.NewBufferString(body))
+	rec := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	h.RegisterRoutes(router)
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestSearchAnalyze_SearchError(t *testing.T) {
+	tc := &mockToolCaller{
+		searchErr: errors.New("storage timeout"),
+	}
+	h := newTestAnalysisHandlerWithToolCaller(t, "", tc)
+
+	body, _ := json.Marshal(searchAnalyzeRequest{
+		Params: SearchParams{Service: "svc"},
+	})
+	req := httptest.NewRequest(http.MethodPost, searchAnalyzePath, bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	h.RegisterRoutes(router)
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusInternalServerError, rec.Code)
+}
+
+func TestSearchAnalyze_InvalidJSON(t *testing.T) {
+	tc := &mockToolCaller{}
+	h := newTestAnalysisHandlerWithToolCaller(t, "", tc)
+
+	req := httptest.NewRequest(http.MethodPost, searchAnalyzePath, bytes.NewBufferString("{bad"))
+	rec := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	h.RegisterRoutes(router)
+	router.ServeHTTP(rec, req)
+
+	assert.Equal(t, http.StatusBadRequest, rec.Code)
+}
+
+func TestSearchAnalyze_NotRegisteredWithoutToolCaller(t *testing.T) {
+	// Without ToolCaller, the search+analyze route should not be registered.
+	h := newTestAnalysisHandler(t, buildTestTrace(), "response")
+
+	body, _ := json.Marshal(searchAnalyzeRequest{
+		Params: SearchParams{Service: "svc"},
+	})
+	req := httptest.NewRequest(http.MethodPost, searchAnalyzePath, bytes.NewBuffer(body))
+	rec := httptest.NewRecorder()
+
+	router := mux.NewRouter()
+	h.RegisterRoutes(router)
+	router.ServeHTTP(rec, req)
+
+	// mux returns 404 for paths that have no route registered.
+	assert.Equal(t, http.StatusNotFound, rec.Code)
+}
+
+func TestAnalysisHandlerOption_WithToolCaller(t *testing.T) {
+	tc := &mockToolCaller{}
+	h := &AnalysisHandler{}
+	opt := WithToolCaller(tc)
+	opt(h)
+	assert.NotNil(t, h.toolCaller)
+	assert.Same(t, tc, h.toolCaller)
 }
 
 // (end of tests)

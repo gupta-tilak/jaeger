@@ -102,3 +102,41 @@ func (p *SearchParams) ToTraceQueryParams() (*tracestore.TraceQueryParams, error
 
 	return params, nil
 }
+
+// ToMCPArgs converts SearchParams to a map[string]any that matches the
+// MCP search_traces tool's input schema (types.SearchTracesInput field names).
+//
+// This enables NL-extracted parameters to be forwarded to MCP tools
+// interchangeably. The key mapping is:
+//
+//	Service     → service_name
+//	Operation   → span_name
+//	MinDuration → duration_min
+//	MaxDuration → duration_max
+//	SearchDepth → search_depth
+//	Tags        → attributes
+//
+// The method only includes non-zero fields, mirroring the "omitempty"
+// semantics of the MCP input struct.
+func (p *SearchParams) ToMCPArgs() map[string]any {
+	args := make(map[string]any)
+	if p.Service != "" {
+		args["service_name"] = p.Service
+	}
+	if p.Operation != "" {
+		args["span_name"] = p.Operation
+	}
+	if p.MinDuration != "" {
+		args["duration_min"] = p.MinDuration
+	}
+	if p.MaxDuration != "" {
+		args["duration_max"] = p.MaxDuration
+	}
+	if p.SearchDepth > 0 {
+		args["search_depth"] = p.SearchDepth
+	}
+	if len(p.Tags) > 0 {
+		args["attributes"] = p.Tags
+	}
+	return args
+}

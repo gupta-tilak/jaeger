@@ -198,7 +198,11 @@ func initRouter(
 		nlHandler.RegisterRoutes(r)
 	}
 	if nlComponents.Analyzer != nil {
-		analysisHandler := nlquery.NewAnalysisHandler(querySvc, nlComponents.Analyzer, telset.Logger)
+		toolCaller := nlquery.NewQueryServiceToolCaller(querySvc)
+		analysisHandler := nlquery.NewAnalysisHandler(
+			querySvc, nlComponents.Analyzer, telset.Logger,
+			nlquery.WithToolCaller(toolCaller),
+		)
 		analysisHandler.RegisterRoutes(r)
 	}
 

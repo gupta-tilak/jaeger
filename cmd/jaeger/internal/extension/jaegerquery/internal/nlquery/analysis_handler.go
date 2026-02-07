@@ -9,6 +9,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"strings"
 
 	"github.com/gorilla/mux"
 	"go.opentelemetry.io/collector/pdata/pcommon"
@@ -20,9 +21,10 @@ import (
 )
 
 const (
-	analyzeSpanPath  = "/api/nlquery/analyze/span"
-	analyzeTracePath = "/api/nlquery/analyze/trace"
-	followUpPath     = "/api/nlquery/analyze/followup"
+	analyzeSpanPath   = "/api/nlquery/analyze/span"
+	analyzeTracePath  = "/api/nlquery/analyze/trace"
+	followUpPath      = "/api/nlquery/analyze/followup"
+	searchAnalyzePath = "/api/nlquery/analyze/search"
 )
 
 // analyzeSpanRequest is the JSON body for POST /api/nlquery/analyze/span.
@@ -44,10 +46,26 @@ type followUpRequest struct {
 	Question  string `json:"question"`
 }
 
+// searchAnalyzeRequest is the JSON body for POST /api/nlquery/analyze/search.
+// It combines NL-extracted search parameters with analysis in a single call.
+type searchAnalyzeRequest struct {
+	Params    SearchParams `json:"params"`
+	Question  string       `json:"question,omitempty"`
+	SessionID string       `json:"session_id,omitempty"`
+}
+
 // analysisResponse is the JSON response for analysis endpoints.
 type analysisResponse struct {
 	Analysis  string `json:"analysis"`
 	SessionID string `json:"session_id"`
+}
+
+// searchAnalyzeResponse extends analysisResponse with the trace results
+// that were used as context for the analysis.
+type searchAnalyzeResponse struct {
+	Analysis  string              `json:"analysis"`
+	SessionID string              `json:"session_id"`
+	Traces    []TraceSearchResult `json:"traces"`
 }
 
 // AnalysisHandler serves the contextual analysis endpoints.
@@ -55,23 +73,49 @@ type analysisResponse struct {
 // It bridges the HTTP layer with:
 //   - QueryService: to fetch trace/span data from storage
 //   - Analyzer: to send pruned data to the LLM for analysis
+//   - ToolCaller (optional): enables the search+analyze endpoint
 //
 // Endpoints:
-//   - POST /api/nlquery/analyze/span   — Explain a specific span
-//   - POST /api/nlquery/analyze/trace  — Explain an entire trace
+//   - POST /api/nlquery/analyze/span     — Explain a specific span
+//   - POST /api/nlquery/analyze/trace    — Explain an entire trace
 //   - POST /api/nlquery/analyze/followup — Ask a follow-up question
+//   - POST /api/nlquery/analyze/search   — Search traces + analyze results
 type AnalysisHandler struct {
-	querySvc *querysvc.QueryService
-	analyzer *Analyzer
-	logger   *zap.Logger
+	querySvc   *querysvc.QueryService
+	analyzer   *Analyzer
+	toolCaller ToolCaller // optional; enables search+analyze endpoint
+	logger     *zap.Logger
 }
 
 // NewAnalysisHandler creates a handler for trace/span analysis.
-func NewAnalysisHandler(querySvc *querysvc.QueryService, analyzer *Analyzer, logger *zap.Logger) *AnalysisHandler {
-	return &AnalysisHandler{
+// The toolCaller parameter is optional (may be nil). When provided, it
+// enables the POST /api/nlquery/analyze/search endpoint that combines
+// NL-extracted search parameters with trace analysis.
+func NewAnalysisHandler(
+	querySvc *querysvc.QueryService,
+	analyzer *Analyzer,
+	logger *zap.Logger,
+	opts ...AnalysisHandlerOption,
+) *AnalysisHandler {
+	h := &AnalysisHandler{
 		querySvc: querySvc,
 		analyzer: analyzer,
 		logger:   logger,
+	}
+	for _, opt := range opts {
+		opt(h)
+	}
+	return h
+}
+
+// AnalysisHandlerOption configures optional AnalysisHandler dependencies.
+type AnalysisHandlerOption func(*AnalysisHandler)
+
+// WithToolCaller attaches a ToolCaller to the AnalysisHandler,
+// enabling the search+analyze endpoint.
+func WithToolCaller(tc ToolCaller) AnalysisHandlerOption {
+	return func(h *AnalysisHandler) {
+		h.toolCaller = tc
 	}
 }
 
@@ -80,6 +124,9 @@ func (h *AnalysisHandler) RegisterRoutes(router *mux.Router) {
 	router.HandleFunc(analyzeSpanPath, h.handleAnalyzeSpan).Methods(http.MethodPost)
 	router.HandleFunc(analyzeTracePath, h.handleAnalyzeTrace).Methods(http.MethodPost)
 	router.HandleFunc(followUpPath, h.handleFollowUp).Methods(http.MethodPost)
+	if h.toolCaller != nil {
+		router.HandleFunc(searchAnalyzePath, h.handleSearchAnalyze).Methods(http.MethodPost)
+	}
 }
 
 func (h *AnalysisHandler) handleAnalyzeSpan(w http.ResponseWriter, r *http.Request) {
@@ -199,6 +246,80 @@ func (h *AnalysisHandler) handleFollowUp(w http.ResponseWriter, r *http.Request)
 	}
 
 	writeAnalysisResponse(w, analysis, req.SessionID)
+}
+
+// handleSearchAnalyze handles POST /api/nlquery/analyze/search.
+//
+// This endpoint combines the MCP-style search with LLM analysis:
+//  1. Uses the ToolCaller to search for traces matching the NL-extracted params.
+//  2. Sends the search results to the Analyzer for summarization.
+//  3. Returns both the raw trace summaries and the LLM analysis.
+//
+// This is the primary integration point between the nlquery extractor
+// pipeline and the MCP tool infrastructure.
+func (h *AnalysisHandler) handleSearchAnalyze(w http.ResponseWriter, r *http.Request) {
+	var req searchAnalyzeRequest
+	if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+		writeAnalysisError(w, "invalid request body", http.StatusBadRequest)
+		return
+	}
+	if req.Params.Service == "" {
+		writeAnalysisError(w, "params.service is required", http.StatusBadRequest)
+		return
+	}
+
+	// Step 1: Search for traces using the ToolCaller.
+	traces, err := h.toolCaller.SearchTraces(r.Context(), req.Params)
+	if err != nil {
+		h.logger.Error("search traces failed", zap.Error(err))
+		writeAnalysisError(w, "search failed: "+err.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	// Step 2: Build a summary of the search results for the LLM.
+	question := req.Question
+	if question == "" {
+		question = "Analyze these trace search results and identify any notable patterns, errors, or performance issues."
+	}
+	resultSummary := formatSearchResultsForLLM(req.Params, traces)
+	userPrompt := question + "\n\n" + resultSummary
+
+	// Step 3: Send to the analyzer.
+	analysis, sessionID, analysisErr := h.analyzer.analyze(
+		r.Context(), traceAnalysisSystemPrompt, userPrompt, req.SessionID,
+	)
+	if analysisErr != nil {
+		h.logger.Error("search analysis failed", zap.Error(analysisErr))
+		writeAnalysisError(w, "analysis failed: "+analysisErr.Error(), http.StatusInternalServerError)
+		return
+	}
+
+	w.Header().Set("Content-Type", "application/json")
+	json.NewEncoder(w).Encode(searchAnalyzeResponse{
+		Analysis:  analysis,
+		SessionID: sessionID,
+		Traces:    traces,
+	})
+}
+
+// formatSearchResultsForLLM formats trace search results into a human-readable
+// text block suitable for inclusion in an LLM prompt.
+func formatSearchResultsForLLM(params SearchParams, traces []TraceSearchResult) string {
+	var b strings.Builder
+	fmt.Fprintf(&b, "Search: service=%q", params.Service)
+	if params.Operation != "" {
+		fmt.Fprintf(&b, ", operation=%q", params.Operation)
+	}
+	fmt.Fprintf(&b, "\nFound %d traces:\n", len(traces))
+
+	for i, tr := range traces {
+		fmt.Fprintf(&b,
+			"\n[%d] TraceID=%s root=%s/%s spans=%d services=%d duration=%dμs errors=%v",
+			i+1, tr.TraceID, tr.RootService, tr.RootSpanName,
+			tr.SpanCount, tr.ServiceCount, tr.DurationUs, tr.HasErrors,
+		)
+	}
+	return b.String()
 }
 
 // fetchTrace retrieves a single trace from the query service.
