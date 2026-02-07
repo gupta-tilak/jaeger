@@ -183,19 +183,23 @@ func initRouter(
 
 	apiHandler.RegisterRoutes(r)
 
-	// Register the natural language query extraction endpoint.
-	// The extractor implementation is selected based on YAML configuration:
+	// Register the natural language query extraction and analysis endpoints.
+	// The extractor/analyzer implementations are selected based on YAML configuration:
 	//   - No provider: HeuristicExtractor (regex-based, no external dependencies)
-	//   - Provider set: LLM-backed extractor via LangChainGo (local model)
+	//   - Provider set: LLM-backed extractor + analyzer via LangChainGo (local model)
 	// This is additive — it does not modify existing routes or behavior.
-	extractor, err := nlquery.NewExtractorFromConfig(queryOpts.NLQuery, telset.Logger)
+	nlComponents, err := nlquery.NewComponentsFromConfig(queryOpts.NLQuery, telset.Logger)
 	if err != nil {
-		telset.Logger.Error("failed to create nlquery extractor, falling back to heuristic", zap.Error(err))
-		extractor = &nlquery.HeuristicExtractor{}
+		telset.Logger.Error("failed to create nlquery components, falling back to heuristic", zap.Error(err))
+		nlComponents = &nlquery.Components{Extractor: &nlquery.HeuristicExtractor{}}
 	}
-	if extractor != nil {
-		nlHandler := nlquery.NewHTTPHandler(extractor, telset.Logger)
+	if nlComponents.Extractor != nil {
+		nlHandler := nlquery.NewHTTPHandler(nlComponents.Extractor, telset.Logger)
 		nlHandler.RegisterRoutes(r)
+	}
+	if nlComponents.Analyzer != nil {
+		analysisHandler := nlquery.NewAnalysisHandler(querySvc, nlComponents.Analyzer, telset.Logger)
+		analysisHandler.RegisterRoutes(r)
 	}
 
 	staticHandlerCloser := RegisterStaticHandler(r, telset.Logger, queryOpts, querySvc.GetCapabilities())

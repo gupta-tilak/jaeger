@@ -46,3 +46,46 @@ func TestCreateModel_UnsupportedProvider(t *testing.T) {
 	assert.Contains(t, err.Error(), "unsupported nlquery provider")
 	assert.Contains(t, err.Error(), "magic-llm")
 }
+
+func TestNewComponentsFromConfig_Disabled(t *testing.T) {
+	cfg := Config{Enabled: false}
+	comps, err := NewComponentsFromConfig(cfg, zap.NewNop())
+	require.NoError(t, err)
+	assert.Nil(t, comps.Extractor)
+	assert.Nil(t, comps.Analyzer)
+	assert.Nil(t, comps.Sessions)
+}
+
+func TestNewComponentsFromConfig_NoProvider(t *testing.T) {
+	cfg := Config{Enabled: true}
+	comps, err := NewComponentsFromConfig(cfg, zap.NewNop())
+	require.NoError(t, err)
+	require.NotNil(t, comps.Extractor)
+	_, ok := comps.Extractor.(*HeuristicExtractor)
+	assert.True(t, ok, "should produce HeuristicExtractor when no provider")
+	assert.Nil(t, comps.Analyzer, "analyzer requires a provider")
+	assert.NotNil(t, comps.Sessions)
+	comps.Close()
+}
+
+func TestNewComponentsFromConfig_UnsupportedProvider(t *testing.T) {
+	cfg := Config{
+		Enabled:  true,
+		Provider: "unsupported",
+		Endpoint: "http://localhost:11434",
+		Model:    "model",
+	}
+	_, err := NewComponentsFromConfig(cfg, zap.NewNop())
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "unsupported nlquery provider")
+}
+
+func TestComponents_Close_NilSessions(_ *testing.T) {
+	comps := &Components{}
+	comps.Close() // Should not panic
+}
+
+func TestSessionTTLFromConfig(t *testing.T) {
+	ttl := SessionTTLFromConfig(Config{})
+	assert.Equal(t, defaultSessionTTL, ttl)
+}
