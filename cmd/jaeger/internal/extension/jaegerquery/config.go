@@ -29,6 +29,8 @@ type Storage struct {
 }
 
 func (cfg *Config) Validate() error {
-	_, err := govalidator.ValidateStruct(cfg)
-	return err
+	if _, err := govalidator.ValidateStruct(cfg); err != nil {
+		return err
+	}
+	return cfg.NLQuery.Validate()
 }

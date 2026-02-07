@@ -11,6 +11,7 @@ import (
 	"go.opentelemetry.io/collector/config/confighttp"
 	"go.opentelemetry.io/collector/config/confignet"
 
+	"github.com/jaegertracing/jaeger/cmd/jaeger/internal/extension/jaegerquery/internal/nlquery"
 	"github.com/jaegertracing/jaeger/internal/tenancy"
 	"github.com/jaegertracing/jaeger/ports"
 )
@@ -42,11 +43,14 @@ type QueryOptions struct {
 	HTTP confighttp.ServerConfig `mapstructure:"http"`
 	// GRPC holds the GRPC configuration that the query service uses to serve requests.
 	GRPC configgrpc.ServerConfig `mapstructure:"grpc"`
+	// NLQuery holds configuration for the natural language query extraction feature.
+	NLQuery nlquery.Config `mapstructure:"nlquery"`
 }
 
 func DefaultQueryOptions() QueryOptions {
 	return QueryOptions{
 		MaxClockSkewAdjust: 0, // disabled by default
+		NLQuery:            nlquery.DefaultConfig(),
 		HTTP: confighttp.ServerConfig{
 			NetAddr: confignet.AddrConfig{
 				Endpoint:  ports.PortToHostPort(ports.QueryHTTP),
