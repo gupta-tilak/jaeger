@@ -19,11 +19,12 @@
 8. [Configuration](#8-configuration)
 9. [HTTP API Reference](#9-http-api-reference)
 10. [Implementation Details](#10-implementation-details)
-11. [Testing Strategy](#11-testing-strategy)
-12. [Code Metrics](#12-code-metrics)
-13. [Security & Safety Guarantees](#13-security--safety-guarantees)
-14. [Deployment & Operator Guide](#14-deployment--operator-guide)
-15. [Future Work](#15-future-work)
+11. [MCP Integration — ToolCaller Bridge (Option B)](#11-mcp-integration--toolcaller-bridge-option-b)
+12. [Testing Strategy](#12-testing-strategy)
+13. [Code Metrics](#13-code-metrics)
+14. [Security & Safety Guarantees](#14-security--safety-guarantees)
+15. [Deployment & Operator Guide](#15-deployment--operator-guide)
+16. [Future Work](#16-future-work)
 
 ---
 
@@ -38,8 +39,9 @@ This document describes the design and implementation of two AI-powered features
 Both features are designed as **additive extensions** to the Query Service. They introduce zero changes to existing APIs, zero changes to storage backends, and zero external cloud dependencies. The LLM runs locally (e.g., Ollama with a 0.5B–3B parameter model) and is treated strictly as an **extraction/summarization tool** — never as a decision maker.
 
 **Key numbers:**
-- 12 production files, 1,720 lines of production code
-- 11 test files, 1,933 lines of test code, 101 test functions
+- 13 production files, 2,055 lines of production code
+- 12 test files, 2,397 lines of test code, 123 test functions
+- MCP ToolCaller bridge: enables search+analyze in a single endpoint
 - `make fmt` ✅ | `make lint` ✅ (0 issues) | `make test` ✅ (all pass, no goroutine leaks)
 
 ---
@@ -127,10 +129,11 @@ If the LLM server is unreachable, the system falls back to heuristic extraction 
 │  ┌──────────────────────────────────────────────────────────────┐   │
 │  │                    New Routes (additive)                      │   │
 │  │                                                              │   │
-│  │  POST /api/nlquery        ──► NL Search Extraction           │   │
-│  │  POST /api/nlquery/analyze/span   ──► Span Analysis          │   │
-│  │  POST /api/nlquery/analyze/trace  ──► Trace Analysis         │   │
+│  │  POST /api/nlquery               ──► NL Search Extraction    │   │
+│  │  POST /api/nlquery/analyze/span  ──► Span Analysis           │   │
+│  │  POST /api/nlquery/analyze/trace ──► Trace Analysis          │   │
 │  │  POST /api/nlquery/analyze/followup ──► Follow-up Q&A        │   │
+│  │  POST /api/nlquery/analyze/search ──► Search + Analyze (MCP) │   │
 │  └──────────────────────────────────────────────────────────────┘   │
 │                              │                                      │
 │                    ┌─────────┴──────────┐                           │
@@ -140,12 +143,15 @@ If the LLM server is unreachable, the system falls back to heuristic extraction 
 │    │               │  • Extractor       ├──────────────┐            │
 │    │               │  • Analyzer        │              │            │
 │    │               │  • SessionManager  │         ┌────┴─────┐     │
-│    │               └────────────────────┘         │ Ollama   │     │
-│    │                                              │ (local)  │     │
-│    ▼                                              │ qwen2/   │     │
-│  QueryService.GetTraces()                         │ llama3/  │     │
-│  (existing — unchanged)                           │ phi3     │     │
-│                                                   └──────────┘     │
+│    │               │  • ToolCaller      │         │ Ollama   │     │
+│    │               └────────┬───────────┘         │ (local)  │     │
+│    │                        │                     │ qwen2/   │     │
+│    ▼                        ▼                     │ llama3/  │     │
+│  QueryService         ToolCaller                  │ phi3     │     │
+│  .GetTraces()         .SearchTraces()             └──────────┘     │
+│  (existing)           .GetServices()                               │
+│                       (same QueryService                           │
+│                        methods as MCP tools)                       │
 └─────────────────────────────────────────────────────────────────────┘
 ```
 
@@ -159,14 +165,15 @@ cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/
 ├── extractor.go           # Extractor interface + StubExtractor
 ├── heuristic.go           # Regex-based extraction (no LLM)
 ├── llm_extractor.go       # LLM-backed extraction via LangChainGo
-├── params.go              # SearchParams struct + ToTraceQueryParams()
+├── params.go              # SearchParams struct + ToTraceQueryParams() + ToMCPArgs()
 ├── handler.go             # HTTP handler for POST /api/nlquery
-├── analysis_handler.go    # HTTP handlers for span/trace analysis + follow-up
+├── analysis_handler.go    # HTTP handlers for span/trace/search analysis + follow-up
 ├── analyzer.go            # LLM analysis engine with session integration
 ├── pruner.go              # Trace/span data pruning for LLM context windows
 ├── session.go             # TTL-based session manager for conversations
 ├── provider.go            # Component factory (creates model, extractor, analyzer)
-└── *_test.go              # 101 test functions across 11 test files
+├── mcp_bridge.go          # ToolCaller interface + QueryServiceToolCaller implementation
+└── *_test.go              # 123 test functions across 12 test files
 ```
 
 Modified files outside the package (minimal, additive only):
@@ -668,6 +675,55 @@ Sends a follow-up question in an existing session with full conversation history
 
 ---
 
+### POST /api/nlquery/analyze/search — Search + Analyze (MCP Bridge)
+
+Searches for traces matching NL-extracted parameters and analyzes the results in a single call. Only available when a `ToolCaller` is configured (see [Section 11](#11-mcp-integration--toolcaller-bridge-option-b)).
+
+**Request:**
+```json
+{
+  "params": {
+    "service": "payment-service",
+    "tags": { "error": "true" },
+    "minDuration": "2s"
+  },
+  "question": "Why are these requests failing?",
+  "session_id": ""
+}
+```
+
+- `params` — NL-extracted `SearchParams` (same schema as `/api/nlquery` response). `service` is required.
+- `question` — Optional analysis focus. Defaults to: *"Analyze these trace search results and identify any notable patterns, errors, or performance issues."*
+- `session_id` — Optional. Reuse existing session for follow-up context.
+
+**Response (200):**
+```json
+{
+  "analysis": "Found 3 traces from payment-service with errors. All 3 traces show timeouts in the database-service span...",
+  "session_id": "a1b2c3d4e5f67890a1b2c3d4e5f67890",
+  "traces": [
+    {
+      "trace_id": "0123456789abcdef0123456789abcdef",
+      "root_service": "payment-service",
+      "root_span_name": "POST /pay",
+      "start_time": "2026-02-07T10:30:00Z",
+      "duration_us": 5200000,
+      "span_count": 8,
+      "service_count": 3,
+      "has_errors": true
+    }
+  ]
+}
+```
+
+**Errors:**
+| Code | Condition |
+|------|-----------|
+| 400 | Missing `params.service`, malformed JSON |
+| 500 | Search error, LLM failure |
+
+---
+
 ## 10. Implementation Details
 
 ### Component Factory Pattern
@@ -708,7 +764,11 @@ if nlComponents.Extractor != nil {
     nlHandler.RegisterRoutes(r)
 }
 if nlComponents.Analyzer != nil {
-    analysisHandler := nlquery.NewAnalysisHandler(querySvc, nlComponents.Analyzer, telset.Logger)
+    toolCaller := nlquery.NewQueryServiceToolCaller(querySvc)
+    analysisHandler := nlquery.NewAnalysisHandler(
+        querySvc, nlComponents.Analyzer, telset.Logger,
+        nlquery.WithToolCaller(toolCaller),
+    )
     analysisHandler.RegisterRoutes(r)
 }
 ```
@@ -729,7 +789,256 @@ Trace IDs (32 hex chars → 16 bytes) and Span IDs (16 hex chars → 8 bytes) ar
 
 ---
 
-## 11. Testing Strategy
+## 11. MCP Integration — ToolCaller Bridge (Option B)
+
+### How MCP Tools Map to nlquery Features
+
+The Jaeger MCP server (`cmd/jaeger/internal/extension/jaegermcp/`) exposes 7 tools that AI clients (IDE assistants, Claude Desktop, etc.) can call via the Model Context Protocol. Many of these tools perform the *same underlying operations* as the nlquery analysis pipeline:
+
+| MCP Tool | Function | nlquery Equivalent |
+|----------|----------|-------------------|
+| `search_traces` | Find traces by service, time, attributes, duration | `SearchParams.ToTraceQueryParams()` → `QueryService.FindTraces()` |
+| `get_services` | List available service names | `QueryService.GetServices()` |
+| `get_span_details` | Fetch full span attributes, events, links | `AnalysisHandler.fetchTrace()` → `FindSpanInTrace()` |
+| `get_trace_errors` | Get spans with error status | `PruneTrace()` extracts error status per span |
+| `get_trace_topology` | Get parent-child span tree | `PrunedTrace.Spans` with `ParentSpanID` fields |
+| `get_critical_path` | Identify the latency-critical path | Not yet in nlquery (future extension) |
+| `get_span_names` | List span names for a service | Not used by nlquery |
+
+The key observation: **both the MCP tools and the nlquery features call the same `QueryService` methods** (`FindTraces`, `GetTraces`, `GetServices`). The difference is the transport:
+- MCP tools receive parameters as JSON over SSE transport and return structured JSON.
+- nlquery receives parameters from an LLM extractor and returns them to an LLM analyzer.
+
+This creates a natural integration opportunity: instead of duplicating the search logic, nlquery can **reuse the same query patterns** that the MCP tools use.
+
+### Integration Options Considered
+
+Three integration architectures were evaluated:
+
+#### Option A — Shared Query Interfaces
+
+Extract the `queryServiceInterface` types already defined in the MCP handler files into a shared package, then import that package from nlquery.
+
+| Aspect | Assessment |
+|--------|-----------|
+| **Approach** | Move MCP's `queryServiceInterface` to a shared `internal/queryapi` package |
+| **Coupling** | Creates a compile-time dependency between the Query Service extension and the MCP extension |
+| **Risk** | The MCP extension and Query Service extension are independent OTel Collector extensions with different lifecycles. Shared types create version coupling. |
+| **Verdict** | ❌ Rejected — creates undesirable coupling between independently deployable extensions |
+
+#### Option B — ToolCaller Interface (Implemented)
+
+Define a narrow `ToolCaller` interface *inside* the nlquery package that mirrors the operations the MCP tools perform, with a concrete implementation that wraps `QueryService` directly.
+
+| Aspect | Assessment |
+|--------|-----------|
+| **Approach** | Interface in nlquery → concrete `QueryServiceToolCaller` wraps `querysvc.QueryService` |
+| **Coupling** | Zero coupling to MCP extension. nlquery depends only on `querysvc.QueryService` (already a dependency). |
+| **Testability** | `mockToolCaller` in tests — no storage, no network, no MCP server needed |
+| **Schema parity** | `SearchParams.ToMCPArgs()` produces the same key-value map as `types.SearchTracesInput` |
+| **Verdict** | ✅ Implemented — best balance of functionality, decoupling, and testability |
+
+#### Option C — Full Agentic Loop
+
+Make the LLM an autonomous agent that calls MCP tools in a loop, synthesizing information across multiple tool calls before producing an analysis.
+
+| Aspect | Assessment |
+|--------|-----------|
+| **Approach** | LLM decides which MCP tools to call, interprets results, calls more tools, then produces analysis |
+| **Complexity** | Requires tool-use prompting, output parsing, loop control, safety limits |
+| **Latency** | Multiple model inference + tool call round trips per request |
+| **Safety** | LLM becomes a decision maker (violates design philosophy) |
+| **Verdict** | ❌ Deferred — future work once the foundation is proven. The ToolCaller interface provides the extension point needed to add agentic behavior later. |
+
+### Option B Implementation
+
+#### The ToolCaller Interface
+
+```go
+// ToolCaller abstracts trace query operations that both the MCP tools and
+// the nlquery analysis pipeline perform.
+type ToolCaller interface {
+    SearchTraces(ctx context.Context, params SearchParams) ([]TraceSearchResult, error)
+    GetServices(ctx context.Context) ([]string, error)
+}
+```
+
+The interface is deliberately narrow — only the two operations that the analysis pipeline actually needs. This follows the Interface Segregation Principle: consumers should not depend on methods they don't use.
+
+#### TraceSearchResult
+
+```go
+type TraceSearchResult struct {
+    TraceID      string `json:"trace_id"`
+    RootService  string `json:"root_service"`
+    RootSpanName string `json:"root_span_name"`
+    StartTime    string `json:"start_time"`
+    DurationUs   int64  `json:"duration_us"`
+    SpanCount    int    `json:"span_count"`
+    ServiceCount int    `json:"service_count"`
+    HasErrors    bool   `json:"has_errors"`
+}
+```
+
+This struct mirrors the MCP `types.TraceSummary` schema field-for-field. It is defined in the nlquery package (not imported from MCP) to avoid a package dependency from the Query Service extension to the MCP extension. JSON-serialized output from either type is interchangeable.
+
+#### QueryServiceToolCaller
+
+The concrete implementation wraps `querysvc.QueryService` — the same service that the MCP tool handlers wrap:
+
+```go
+type QueryServiceToolCaller struct {
+    querySvc *querysvc.QueryService
+}
+
+func (tc *QueryServiceToolCaller) SearchTraces(
+    ctx context.Context, params SearchParams,
+) ([]TraceSearchResult, error) {
+    tqp, err := params.ToTraceQueryParams()  // reuse existing conversion
+    // ... set default time range (mirrors MCP's "-1h" default) ...
+    tracesIter := tc.querySvc.FindTraces(ctx, queryParams)
+    aggregatedIter := jptrace.AggregateTraces(tracesIter)
+    // ... iterate and build []TraceSearchResult ...
+}
+```
+
+The implementation mirrors the MCP `searchTracesHandler.handle()` logic:
+1. Convert params → `TraceQueryParams` (same conversion both use)
+2. Apply default time range (1h lookback, matches MCP's default)
+3. Call `QueryService.FindTraces()` (same method MCP calls)
+4. Aggregate via `jptrace.AggregateTraces()` (same helper MCP uses)
+5. Build lightweight summaries (same fields MCP returns)
+
+#### SearchParams.ToMCPArgs()
+
+```go
+func (p *SearchParams) ToMCPArgs() map[string]any {
+    args := make(map[string]any)
+    if p.Service != "" {
+        args["service_name"] = p.Service  // nlquery "Service" → MCP "service_name"
+    }
+    if p.Operation != "" {
+        args["span_name"] = p.Operation   // nlquery "Operation" → MCP "span_name"
+    }
+    // ... duration_min, duration_max, search_depth, attributes ...
+    return args
+}
+```
+
+This method provides schema compatibility. The NL extractor produces `SearchParams` with field names reflecting Jaeger terminology (`Service`, `Operation`), while the MCP tool uses OpenTelemetry terminology (`service_name`, `span_name`). `ToMCPArgs()` bridges this naming gap, enabling the extracted parameters to be forwarded to either the direct query path or an MCP tool call.
+
+#### Wiring via Functional Options
+
+The `ToolCaller` is injected into `AnalysisHandler` using the functional options pattern, keeping backward compatibility:
+
+```go
+type AnalysisHandlerOption func(*AnalysisHandler)
+
+func WithToolCaller(tc ToolCaller) AnalysisHandlerOption {
+    return func(h *AnalysisHandler) { h.toolCaller = tc }
+}
+
+func NewAnalysisHandler(
+    querySvc *querysvc.QueryService,
+    analyzer *Analyzer,
+    logger *zap.Logger,
+    opts ...AnalysisHandlerOption,
+) *AnalysisHandler { ... }
+```
+
+When `ToolCaller` is provided, the handler registers an additional route:
+
+```
+POST /api/nlquery/analyze/search  ──► Search + Analyze in one call
+```
+
+When `ToolCaller` is `nil` (e.g., in unit tests or minimal deployments), the search+analyze endpoint is simply not registered. Existing endpoints are unaffected.
+
+#### The Search + Analyze Endpoint
+
+```
+POST /api/nlquery/analyze/search
+{
+    "params": { "service": "payment-service", "tags": {"error": "true"} },
+    "question": "Why are these requests failing?",     // optional
+    "session_id": ""                                    // optional
+}
+
+Response:
+{
+    "analysis": "Found 3 traces from payment-service with errors...",
+    "session_id": "a1b2c3d4...",
+    "traces": [
+        { "trace_id": "abc...", "root_service": "payment-service", ... },
+        ...
+    ]
+}
+```
+
+This endpoint combines three operations in a single HTTP call:
+
+1. **Search** — `ToolCaller.SearchTraces()` finds matching traces
+2. **Format** — `formatSearchResultsForLLM()` converts results to text for the model
+3. **Analyze** — `Analyzer.analyze()` sends the formatted results + question to the LLM
+
+The response includes both the raw trace summaries (structured data for the UI) and the LLM analysis (human-readable explanation).
+
+#### Data Flow
+
+```
+POST /api/nlquery/analyze/search
+  { params: {service, tags, ...}, question?, session_id? }
+  │
+  ▼
+ToolCaller.SearchTraces(params)
+  │  └── params.ToTraceQueryParams()     ◄── shared conversion
+  │      QueryService.FindTraces()       ◄── same as MCP search_traces
+  │      jptrace.AggregateTraces()       ◄── same aggregation
+  │      buildTraceSearchResult()        ◄── same summary schema
+  │
+  ▼
+formatSearchResultsForLLM(params, traces)
+  │  └── "Search: service="payment-service"
+  │       Found 3 traces:
+  │       [1] TraceID=abc... root=payment/POST spans=5 errors=true"
+  │
+  ▼
+Analyzer.analyze(systemPrompt, userPrompt, sessionID)
+  │  └── model.GenerateContent(messages)  ◄── Ollama API call
+  │
+  ▼
+{ analysis, session_id, traces[] }
+```
+
+### Test Coverage for MCP Bridge
+
+| Test | What It Verifies |
+|------|-----------------|
+| `TestQueryServiceToolCaller_SearchTraces_Success` | End-to-end search with mocked storage returns correct summaries |
+| `TestQueryServiceToolCaller_SearchTraces_InvalidParams` | Invalid duration strings are caught |
+| `TestQueryServiceToolCaller_SearchTraces_EmptyResults` | Empty iterator returns empty slice, no error |
+| `TestQueryServiceToolCaller_SearchTraces_WithErrors` | Error spans correctly set `HasErrors: true` |
+| `TestQueryServiceToolCaller_SearchTraces_MultiService` | Multiple resource spans → correct service count |
+| `TestQueryServiceToolCaller_GetServices` | Delegates to QueryService correctly |
+| `TestQueryServiceToolCaller_GetServices_Error` | Storage errors propagate |
+| `TestBuildTraceSearchResult_BasicTrace` | All fields extracted from single span |
+| `TestBuildTraceSearchResult_EmptyTrace` | Zero spans → zero counts |
+| `TestFormatSearchResultsForLLM_Basic` | Text formatting includes service, count, trace details |
+| `TestFormatSearchResultsForLLM_WithOperation` | Operation filter appears in formatted text |
+| `TestToMCPArgs_AllFields` | All SearchParams fields map to correct MCP keys |
+| `TestToMCPArgs_EmptyParams` | Empty params → empty map |
+| `TestToMCPArgs_PartialFields` | Only set fields appear in map |
+| `TestSearchAnalyze_Success` | Full endpoint: search + analyze + response with traces |
+| `TestSearchAnalyze_CustomQuestion` | Custom question is forwarded to analyzer |
+| `TestSearchAnalyze_MissingService` | Missing service returns 400 |
+| `TestSearchAnalyze_SearchError` | Storage error returns 500 |
+| `TestSearchAnalyze_InvalidJSON` | Malformed JSON returns 400 |
+| `TestSearchAnalyze_NotRegisteredWithoutToolCaller` | No ToolCaller → endpoint not registered (404) |
+| `TestAnalysisHandlerOption_WithToolCaller` | Functional option sets field correctly |
+
+---
+
+## 12. Testing Strategy
 
 ### Test Coverage
 
@@ -744,8 +1053,9 @@ Trace IDs (32 hex chars → 16 bytes) and Span IDs (16 hex chars → 8 bytes) ar
 | `session.go` | `session_test.go` | 10 | Create, get, expiry, add message, TTL refresh, eviction, delete, sweep, ID uniqueness |
 | `pruner.go` | `pruner_test.go` | 19 | All span fields, attribute cap, events, error status, multi-service traces, text formatting |
 | `analyzer.go` | `analyzer_test.go` | 11 | Span/trace analysis, session reuse, invalid session, follow-up, LLM errors, message building |
-| `analysis_handler.go` | `analysis_handler_test.go` | 17 | All HTTP endpoints, ID parsing (valid/invalid), not-found paths, success paths |
+| `analysis_handler.go` | `analysis_handler_test.go` | 24 | All HTTP endpoints, ID parsing, not-found paths, search+analyze, MCP wiring |
 | `provider.go` | `provider_test.go` | 5 | Disabled config, no provider, unsupported provider, nil sessions close, TTL from config |
+| `mcp_bridge.go` | `mcp_bridge_test.go` | 18 | ToolCaller search/services, buildTraceSearchResult, ToMCPArgs, formatSearchResultsForLLM |
 
 ### Mock Strategy
 
@@ -765,16 +1075,16 @@ The package uses Jaeger's standard `testutils.VerifyGoLeaks(m)` in `TestMain`. T
 
 ---
 
-## 12. Code Metrics
+## 13. Code Metrics
 
 | Metric | Value |
 |--------|-------|
-| Production files | 12 |
-| Test files | 11 |
-| Production lines | 1,720 |
-| Test lines | 1,933 |
-| Test functions | 101 |
-| Test-to-production ratio | 1.12:1 |
+| Production files | 13 |
+| Test files | 12 |
+| Production lines | 2,055 |
+| Test lines | 2,397 |
+| Test functions | 123 |
+| Test-to-production ratio | 1.17:1 |
 | External dependencies added | 0 (LangChainGo was already in go.mod) |
 | Existing files modified | 2 (server.go, flags.go — additive only) |
 | Existing tests broken | 0 |
@@ -782,7 +1092,7 @@ The package uses Jaeger's standard `testutils.VerifyGoLeaks(m)` in `TestMain`. T
 
 ---
 
-## 13. Security & Safety Guarantees
+## 14. Security & Safety Guarantees
 
 ### Data Safety
 
@@ -811,7 +1121,7 @@ The operator has full control over:
 
 ---
 
-## 14. Deployment & Operator Guide
+## 15. Deployment & Operator Guide
 
 ### Prerequisites
 
@@ -856,11 +1166,11 @@ curl -X POST http://localhost:16686/api/nlquery \
 
 ---
 
-## 15. Future Work
+## 16. Future Work
 
 These features provide the foundation for more advanced AI capabilities:
 
-1. **UI Integration** — Add a natural language search bar in the Jaeger UI that calls the `/api/nlquery` endpoint and auto-fills search fields.
+1. **UI Integration** — Add a natural language search bar in the Jaeger UI that calls the `/api/nlquery` endpoint and auto-fills search fields. The `/api/nlquery/analyze/search` endpoint can power a "smart search" panel that shows both results and an AI summary.
 
 2. **Anomaly Detection** — Use the pruner and analysis infrastructure to compare spans against historical baselines and flag anomalies.
 
@@ -872,7 +1182,9 @@ These features provide the foundation for more advanced AI capabilities:
 
 6. **Configurable Session TTL** — Expose session TTL as a YAML config option (the `SessionTTLFromConfig()` extension point already exists).
 
-7. **MCP Server Integration** — The existing Jaeger MCP server could use the Analyzer for AI-powered tool implementations, enabling IDE-based trace analysis.
+7. **Agentic MCP Loop (Option C)** — The `ToolCaller` interface provides the extension point for a full agentic loop where the LLM autonomously decides which tools to call (search, get services, get span details, get critical path), synthesizes results across multiple rounds, and produces a comprehensive analysis. This is architecturally ready but deferred until the simpler Option B pipeline proves its value in production.
+
+8. **ToolCaller Expansion** — Add `GetSpanDetails()`, `GetTraceTopology()`, and `GetCriticalPath()` to the `ToolCaller` interface, enabling the analyzer to drill deeper into specific traces during the search+analyze flow.
 
 ---
 
@@ -884,10 +1196,11 @@ These features provide the foundation for more advanced AI capabilities:
 | [extractor.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/extractor.go) | 47 | `Extractor` interface definition and `StubExtractor` |
 | [heuristic.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/heuristic.go) | 154 | Regex-based NL → SearchParams extraction, zero dependencies |
 | [llm_extractor.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/llm_extractor.go) | 138 | LLM-backed extraction with system prompt, JSON mode, safety firewall |
-| [params.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/params.go) | 104 | `SearchParams` struct and conversion to `TraceQueryParams` |
+| [params.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/params.go) | 142 | `SearchParams` struct, `ToTraceQueryParams()`, and `ToMCPArgs()` |
 | [handler.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/handler.go) | 104 | HTTP handler for POST /api/nlquery |
-| [analysis_handler.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/analysis_handler.go) | 267 | HTTP handlers for span/trace analysis and follow-up |
+| [analysis_handler.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/analysis_handler.go) | 388 | HTTP handlers for span/trace/search analysis, follow-up, and MCP bridge wiring |
 | [analyzer.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/analyzer.go) | 198 | LLM analysis engine with session-aware conversation |
 | [pruner.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/pruner.go) | 292 | Trace/span data pruning and LLM text formatting |
 | [session.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/session.go) | 189 | In-memory TTL-based session manager with background GC |
 | [provider.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/provider.go) | 140 | Component factory — creates model, extractor, analyzer, sessions |
+| [mcp_bridge.go](../cmd/jaeger/internal/extension/jaegerquery/internal/nlquery/mcp_bridge.go) | 176 | `ToolCaller` interface, `QueryServiceToolCaller` impl, `TraceSearchResult` |
