@@ -77,9 +77,10 @@ func createOllamaModel(cfg Config, logger *zap.Logger) (llms.Model, error) {
 		// Force JSON output at the Ollama API level.
 		// This is complementary to llms.WithJSONMode() used at call time.
 		ollama.WithFormat("json"),
-		// Inject the system prompt at construction time so every call
-		// enforces the schema-restricted extraction behavior.
-		ollama.WithSystemPrompt(systemPrompt),
+		// NOTE: Do NOT use ollama.WithSystemPrompt() here. It only affects
+		// the legacy /api/generate path, not /api/chat used by GenerateContent.
+		// The system prompt is injected per-call via llms.ChatMessageTypeSystem
+		// in LLMExtractor.Extract().
 	}
 
 	return ollama.New(opts...)

@@ -6,6 +6,7 @@ package nlquery
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 
 	"github.com/tmc/langchaingo/llms"
@@ -96,7 +97,16 @@ func NewLLMExtractor(model llms.Model, config Config, logger *zap.Logger) *LLMEx
 // If the LLM returns invalid JSON, an error is returned rather than an empty
 // struct - fail-fast over silent data loss.
 func (e *LLMExtractor) Extract(ctx context.Context, input string) (SearchParams, error) {
-	completion, err := llms.GenerateFromSinglePrompt(ctx, e.model, input,
+	// Use GenerateContent with explicit system + human messages.
+	// GenerateFromSinglePrompt / Call only send a human message and
+	// ignore the system prompt set at construction time, which means
+	// the model has no extraction schema instructions.
+	messages := []llms.MessageContent{
+		llms.TextParts(llms.ChatMessageTypeSystem, systemPrompt),
+		llms.TextParts(llms.ChatMessageTypeHuman, input),
+	}
+
+	resp, err := e.model.GenerateContent(ctx, messages,
 		llms.WithTemperature(e.config.Temperature),
 		llms.WithMaxTokens(e.config.MaxTokens),
 		llms.WithJSONMode(),
@@ -104,6 +114,11 @@ func (e *LLMExtractor) Extract(ctx context.Context, input string) (SearchParams,
 	if err != nil {
 		return SearchParams{}, fmt.Errorf("llm generation failed: %w", err)
 	}
+
+	if len(resp.Choices) == 0 {
+		return SearchParams{}, errors.New("llm returned empty response")
+	}
+	completion := resp.Choices[0].Content
 
 	e.logger.Debug("llm raw response",
 		zap.String("input", input),

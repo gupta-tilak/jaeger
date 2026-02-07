@@ -102,6 +102,31 @@ func TestLLMExtractor_Extract_ModelError(t *testing.T) {
 	assert.Contains(t, err.Error(), "llm generation failed")
 }
 
+func TestLLMExtractor_Extract_EmptyChoices(t *testing.T) {
+	emptyModel := &emptyChoicesModel{}
+	cfg := Config{Temperature: 0.0, MaxTokens: 256}
+	ext := NewLLMExtractor(emptyModel, cfg, zap.NewNop())
+
+	_, err := ext.Extract(context.Background(), "show traces")
+	require.Error(t, err)
+	assert.Contains(t, err.Error(), "empty response")
+}
+
+// emptyChoicesModel returns a response with no choices.
+type emptyChoicesModel struct{}
+
+func (*emptyChoicesModel) GenerateContent(
+	_ context.Context,
+	_ []llms.MessageContent,
+	_ ...llms.CallOption,
+) (*llms.ContentResponse, error) {
+	return &llms.ContentResponse{Choices: []*llms.ContentChoice{}}, nil
+}
+
+func (*emptyChoicesModel) Call(_ context.Context, _ string, _ ...llms.CallOption) (string, error) {
+	return "", nil
+}
+
 func TestLLMExtractor_Extract_AllFields(t *testing.T) {
 	model := &fakeModel{
 		response: `{
